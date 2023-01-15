@@ -126,6 +126,12 @@ class ZipStream
      * );
      * ```
      *
+     * @param OperationMode $operationMode
+     * The mode can be used to switch between `NORMAL` and `SIMULATION_*` modes.
+     * For details see the `OperationMode` documentation.
+     *
+     * Default to `NORMAL`.
+     *
      * @param string $comment
      * Archive Level Comment
      *
@@ -194,6 +200,7 @@ class ZipStream
      * @return self
      */
     public function __construct(
+        private readonly OperationMode $operationMode = OperationMode::NORMAL,
         private readonly string $comment = '',
         $outputStream = null,
         private readonly CompressionMethod $defaultCompressionMethod = CompressionMethod::DEFLATE,
@@ -246,6 +253,7 @@ class ZipStream
         ?int $deflateLevel = null,
         ?DateTimeInterface $lastModificationDateTime = null,
         ?int $maxSize = null,
+        ?int $exactSize = null,
         ?bool $enableZeroHeader = null,
     ): void {
         $stream = fopen('php://memory', 'rw+');
@@ -277,6 +285,7 @@ class ZipStream
             deflateLevel: $deflateLevel,
             lastModificationDateTime: $lastModificationDateTime,
             maxSize: $maxSize,
+            exactSize: $exactSize,
             enableZeroHeader: $enableZeroHeader,
         );
     }
@@ -327,6 +336,7 @@ class ZipStream
         ?int $deflateLevel = null,
         ?DateTimeInterface $lastModificationDateTime = null,
         ?int $maxSize = null,
+        ?int $exactSize = null,
         ?bool $enableZeroHeader = null,
     ): void {
         if (!is_readable($path)) {
@@ -348,6 +358,7 @@ class ZipStream
             deflateLevel: $deflateLevel,
             lastModificationDateTime: $lastModificationDateTime,
             maxSize: $maxSize,
+            exactSize: $exactSize,
             enableZeroHeader: $enableZeroHeader,
         );
     }
@@ -383,11 +394,14 @@ class ZipStream
         ?int $deflateLevel = null,
         ?DateTimeInterface $lastModificationDateTime = null,
         ?int $maxSize = null,
+        ?int $exactSize = null,
         ?bool $enableZeroHeader = null,
     ): void {
         $file = new File(
             stream: $stream,
             send: $this->send(...),
+            recordSentBytes: $this->recordSentBytes(...),
+            operationMode: $this->operationMode,
             fileName: $fileName,
             startOffset: $this->offset,
             compressionMethod: $compressionMethod ?? $this->defaultCompressionMethod,
@@ -395,6 +409,7 @@ class ZipStream
             deflateLevel: $deflateLevel ?? $this->defaultDeflateLevel,
             lastModificationDateTime: $lastModificationDateTime ?? new DateTimeImmutable(),
             maxSize: $maxSize,
+            exactSize: $exactSize,
             enableZip64: $this->enableZip64,
             enableZeroHeader: $enableZeroHeader ?? $this->defaultEnableZeroHeader,
         );
@@ -445,6 +460,12 @@ class ZipStream
      * The file is considered done when either reaching `EOF`
      * or the `maxSize`.
      *
+     * @param ?int $exactSize
+     * Read exactly `exactSize` bytes from file.
+     * If `EOF` is reached before reading `exactSize` bytes, an error will be
+     * thrown. The parameter allows for faster size calculations if the `stream`
+     * does not support `fstat` size or is slow and otherwise known beforehand.
+     *
      * @param ?bool $enableZeroHeader
      * Override `defaultEnableZeroHeader`
      *
@@ -458,6 +479,7 @@ class ZipStream
         ?int $deflateLevel = null,
         ?DateTimeInterface $lastModificationDateTime = null,
         ?int $maxSize = null,
+        ?int $exactSize = null,
         ?bool $enableZeroHeader = null,
     ): void {
         $this->addFileFromStream(
@@ -468,6 +490,7 @@ class ZipStream
             deflateLevel: $deflateLevel,
             lastModificationDateTime: $lastModificationDateTime,
             maxSize: $maxSize,
+            exactSize: $exactSize,
             enableZeroHeader: $enableZeroHeader,
         );
     }
@@ -503,6 +526,7 @@ class ZipStream
             deflateLevel: null,
             lastModificationDateTime: $lastModificationDateTime,
             maxSize: 0,
+            exactSize: 0,
             enableZeroHeader: false,
         );
     }
@@ -519,7 +543,7 @@ class ZipStream
      * $zip->finish();
      * ```
      */
-    public function finish(): void
+    public function finish(): int
     {
         $centralDirectoryStartOffsetOnDisk = $this->offset;
         $sizeOfCentralDirectory = 0;
@@ -569,8 +593,12 @@ class ZipStream
             zipFileComment: $this->comment,
         ));
 
+        $size = $this->offset;
+
         // The End
         $this->clear();
+
+        return $size;
     }
 
     /**
@@ -589,6 +617,14 @@ class ZipStream
     }
 
     /**
+     * Record sent bytes
+     */
+    private function recordSentBytes(int $sentBytes): void
+    {
+        $this->offset += $sentBytes;
+    }
+
+    /**
      * Send string, sending HTTP headers if necessary.
      * Flush output after write if configure option is set.
      */
@@ -598,25 +634,28 @@ class ZipStream
             throw new RuntimeException('Archive is already finished');
         }
 
-        if ($this->sendHttpHeaders) {
+        if ($this->operationMode === OperationMode::NORMAL && $this->sendHttpHeaders) {
             $this->sendHttpHeaders();
             $this->sendHttpHeaders = false;
         }
 
-        $this->offset += strlen($data);
-        if (fwrite($this->outputStream, $data) === false) {
-            throw new ResourceActionException('fwrite', $this->outputStream);
-        }
+        $this->recordSentBytes(strlen($data));
 
-        if ($this->flushOutput) {
-            // flush output buffer if it is on and flushable
-            $status = ob_get_status();
-            if (isset($status['flags']) && is_int($status['flags']) && ($status['flags'] & PHP_OUTPUT_HANDLER_FLUSHABLE)) {
-                ob_flush();
+        if ($this->operationMode === OperationMode::NORMAL) {
+            if (fwrite($this->outputStream, $data) === false) {
+                throw new ResourceActionException('fwrite', $this->outputStream);
             }
 
-            // Flush system buffers after flushing userspace output buffer
-            flush();
+            if ($this->flushOutput) {
+                // flush output buffer if it is on and flushable
+                $status = ob_get_status();
+                if (isset($status['flags']) && is_int($status['flags']) && ($status['flags'] & PHP_OUTPUT_HANDLER_FLUSHABLE)) {
+                    ob_flush();
+                }
+
+                // Flush system buffers after flushing userspace output buffer
+                flush();
+            }
         }
     }
 

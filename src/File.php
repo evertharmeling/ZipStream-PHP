@@ -32,8 +32,6 @@ class File
 
     private readonly string $fileName;
 
-    private int $totalSize = 0;
-
     /**
      * @var resource
      */
@@ -44,15 +42,18 @@ class File
      */
     public function __construct(
         string $fileName,
-        private int $startOffset,
+        private readonly OperationMode $operationMode,
+        private readonly int $startOffset,
         private readonly CompressionMethod $compressionMethod,
         private readonly string $comment,
         private readonly DateTimeInterface $lastModificationDateTime,
         private readonly int $deflateLevel,
         private readonly ?int $maxSize,
+        private readonly ?int $exactSize,
         private readonly bool $enableZip64,
         private readonly bool $enableZeroHeader,
         private readonly Closure $send,
+        private readonly Closure $recordSentBytes,
         $stream,
     ) {
         $this->fileName = self::filterFilename($fileName);
@@ -81,7 +82,16 @@ class File
 
     public function process(): string
     {
-        if (!$this->enableZeroHeader) {
+        $forecastSize = $this->forecastSize();
+
+        if ($this->enableZeroHeader) {
+            // No calculation required
+        } elseif ($this->isSimulation() && $forecastSize) {
+            $this->uncompressedSize = $forecastSize;
+            $this->compressedSize = $forecastSize;
+        } elseif ($this->operationMode === OperationMode::SIMULATE_STRICT) {
+            throw new RuntimeException('Size of entry must be known without traversal and no compession enabled in SIMULATE_STRICT operationMode.');
+        } else {
             $this->readStream(send: false);
             if (rewind($this->stream) === false) {
                 throw new ResourceActionException('rewind', $this->stream);
@@ -89,10 +99,42 @@ class File
         }
 
         $this->addFileHeader();
-        $this->readStream(send: true);
-        $this->addFileFooter();
 
+        $detectedSize = $forecastSize ?? $this->compressedSize;
+
+        if (
+            $this->isSimulation() &&
+            $detectedSize > 0
+        ) {
+            ($this->recordSentBytes)($detectedSize);
+        } elseif ($this->operationMode === OperationMode::SIMULATE_STRICT) {
+            throw new RuntimeException('Size of entry must be known without traversal and no compession enabled in SIMULATE_STRICT operationMode.');
+        } else {
+            $this->readStream(send: true);
+        }
+
+        $this->addFileFooter();
         return $this->getCdrFile();
+    }
+
+    private function forecastSize(): ?int
+    {
+        if ($this->compressionMethod !== CompressionMethod::STORE) {
+            return null;
+        }
+        if ($this->exactSize) {
+            return $this->exactSize;
+        }
+        $fstat = fstat($this->stream);
+        if (!$fstat || !array_key_exists('size', $fstat) || $fstat['size'] < 1) {
+            return null;
+        }
+
+        if ($this->maxSize !== null && $this->maxSize < $fstat['size']) {
+            return $this->maxSize;
+        }
+
+        return $fstat['size'];
     }
 
     /**
@@ -127,8 +169,6 @@ class File
 
 
         ($this->send)($data);
-
-        $this->totalSize +=  strlen($data);
     }
 
     /**
@@ -239,8 +279,6 @@ class File
         }
 
         ($this->send)($footer);
-
-        $this->totalSize += strlen($footer);
     }
 
     private function readStream(bool $send): void
@@ -251,8 +289,16 @@ class File
 
         $deflate = $this->compressionInit();
 
-        while (!feof($this->stream) && ($this->maxSize === null || $this->uncompressedSize < $this->maxSize)) {
-            $readLength = min(($this->maxSize ?? PHP_INT_MAX) - $this->uncompressedSize, self::CHUNKED_READ_BLOCK_SIZE);
+        while (
+            !feof($this->stream) &&
+            ($this->maxSize === null || $this->uncompressedSize < $this->maxSize) &&
+            ($this->exactSize === null || $this->uncompressedSize < $this->exactSize)
+        ) {
+            $readLength = min(
+                ($this->maxSize ?? PHP_INT_MAX) - $this->uncompressedSize,
+                ($this->exactSize ?? PHP_INT_MAX) - $this->uncompressedSize,
+                self::CHUNKED_READ_BLOCK_SIZE
+            );
 
             $data = fread($this->stream, $readLength);
 
@@ -273,8 +319,11 @@ class File
 
             if ($send) {
                 ($this->send)($data);
-                $this->totalSize += strlen($data);
             }
+        }
+
+        if ($this->exactSize && $this->uncompressedSize !== $this->exactSize) {
+            throw new RuntimeException("File is {$this->uncompressedSize} instead of {$this->exactSize} bytes large. Adjust `exactSize` parameter.");
         }
 
         $this->crc = hexdec(hash_final($hash));
@@ -336,5 +385,10 @@ class File
                 ? 0xFFFFFFFF
                 : $this->startOffset,
         );
+    }
+
+    private function isSimulation(): bool
+    {
+        return $this->operationMode === OperationMode::SIMULATE_LAX || $this->operationMode === OperationMode::SIMULATE_STRICT;
     }
 }
